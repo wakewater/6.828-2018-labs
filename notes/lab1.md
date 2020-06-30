@@ -1,4 +1,7 @@
-# lab1笔记 && 中文代码注释
+# lab1笔记 && 中文代码阅读并注释
+
+    mit 6.828 lab 代码和笔记，以及中文注释源代码已放置在github中:
+    [https://github.com/yunwei37/xv6-labs](https://github.com/yunwei37/xv6-labs)
 
 ## init
 
@@ -106,7 +109,7 @@ PC的软盘和硬盘分为512个字节的区域，称为扇区。
 
 boot/boot.S
 
-```asm
+```s
 #include <inc/mmu.h>
 
 # 启动CPU：切换到32位保护模式，跳至C代码；
@@ -424,4 +427,543 @@ start address 0x0010000c
 - 在开始时，gdb会提示：The target architecture is assumed to be i8086
 - 切换到保护模式之后(ljmpl  $0x8,$0xfd18f指令后)，提示: The target architecture is assumed to be i386
 
-##
+#### 练习6：
+
+重置机器（退出QEMU / GDB并再次启动它们）。在BIOS进入引导加载程序时检查0x00100000处的8个内存字，然后在引导加载程序进入内核时再次检查。
+
+进入引导加载程序:
+
+```
+(gdb) x/8x 0x00100000
+0x100000:	0x00000000	0x00000000	0x00000000	0x00000000
+0x100010:	0x00000000	0x00000000	0x00000000	0x00000000
+
+```
+
+设置断点： b *0x7d81
+
+引导加载程序进入内核:
+
+```
+(gdb) x/8x 0x00100000
+0x100000:	0x1badb002	0x00000000	0xe4524ffe	0x7205c766
+0x100010:	0x34000004	0x2000b812	0x220f0011	0xc0200fd8
+
+```
+
+## Part 3: The Kernel 内核
+
+### 使用虚拟内存解决位置依赖性
+
+内核的链接地址（由objdump打印）与加载地址之间存在（相当大的）差异；操作系统内核通常喜欢被链接并在很高的虚拟地址（例如0xf0100000）上运行，以便将处理器虚拟地址空间的下部留给用户程序使用。
+
+- 链接地址 f0100000 
+- 加载地址 00100000 
+
+许多机器在地址0xf0100000上没有任何物理内存，因此我们不能指望能够在其中存储内核；将使用处理器的内存管理硬件将虚拟地址0xf0100000（内核代码期望在其上运行的链接地址）映射到物理地址0x00100000（引导加载程序将内核加载到物理内存中）。
+
+这样，尽管内核的虚拟地址足够高，可以为用户进程留出足够的地址空间，但是它将被加载到PC RAM中1MB点的BIOS ROM上方的物理内存中。
+
+在这个阶段中，仅映射前4MB的物理内存；
+
+映射：kern/entrypgdir.c 中手写，静态初始化的页面目录和页面表。
+直到kern / entry.S设置了CR0_PG标志，内存引用才被视为物理地址。
+
+-  将范围从0xf0000000到0xf0400000的虚拟地址转换为物理地址0x00000000到0x00400000
+-  将虚拟地址0x00000000到0x00400000转换为物理地址0x00000000到0x00400000
+
+- kern/entrypgdir.c：
+
+```c
+#include <inc/mmu.h>
+#include <inc/memlayout.h>
+
+pte_t entry_pgtable[NPTENTRIES];
+
+// entry.S页面目录从虚拟地址KERNBASE开始映射前4MB的物理内存
+// （也就是说，它映射虚拟地址
+// 地址[KERNBASE，KERNBASE + 4MB）到物理地址[0，4MB）
+// 我们选择4MB，因为这就是我们可以在一页的空间中映射的表
+// 这足以使我们完成启动的早期阶段。我们也映射
+// 虚拟地址[0，4MB）到物理地址[0，4MB）这个
+// 区域对于entry.S中的一些指令至关重要，然后我们
+// 不再使用它。
+//
+// 页面目录（和页面表）必须从页面边界开始，
+// 因此是“ __aligned__”属性。 另外，由于限制
+// 与链接和静态初始化程序有关, 我们在这里使用“ x + PTE_P”
+// 而不是更标准的“ x | PTE_P”。  其他地方
+// 您应该使用“ |”组合标志。
+__attribute__((__aligned__(PGSIZE)))
+pde_t entry_pgdir[NPDENTRIES] = {
+	// 将VA的[0，4MB）映射到PA的[0，4MB）
+	[0]
+		= ((uintptr_t)entry_pgtable - KERNBASE) + PTE_P,
+	// 将VA的[KERNBASE，KERNBASE + 4MB）映射到PA的[0，4MB）
+	[KERNBASE>>PDXSHIFT]
+		= ((uintptr_t)entry_pgtable - KERNBASE) + PTE_P + PTE_W
+};
+
+// 页表的条目0映射到物理页0，条目1映射到
+// 物理页面1，依此类推
+__attribute__((__aligned__(PGSIZE)))
+pte_t entry_pgtable[NPTENTRIES] = {
+	0x000000 | PTE_P | PTE_W,
+	0x001000 | PTE_P | PTE_W,
+	0x002000 | PTE_P | PTE_W,
+	0x003000 | PTE_P | PTE_W,
+	0x004000 | PTE_P | PTE_W,
+	0x005000 | PTE_P | PTE_W,
+  ................
+
+```
+
+- kern/entry.S
+
+```s
+/* See COPYRIGHT for copyright information. */
+
+#include <inc/mmu.h>
+#include <inc/memlayout.h>
+
+# 逻辑右移
+#define SRL(val, shamt)		(((val) >> (shamt)) & ~(-1 << (32 - (shamt))))
+
+
+###################################################################
+# 内核（此代码）链接到地址〜（KERNBASE + 1 Meg），
+# 但引导加载程序会将其加载到地址〜1 Meg。
+#	
+# RELOC（x）将符号x从其链接地址映射到其在
+# 物理内存中的实际位置（其加载地址）。	 
+###################################################################
+
+#define	RELOC(x) ((x) - KERNBASE)
+
+#define MULTIBOOT_HEADER_MAGIC (0x1BADB002)
+#define MULTIBOOT_HEADER_FLAGS (0)
+#define CHECKSUM (-(MULTIBOOT_HEADER_MAGIC + MULTIBOOT_HEADER_FLAGS))
+
+###################################################################
+# 进入点
+###################################################################
+
+.text
+
+# Multiboot标头
+.align 4
+.long MULTIBOOT_HEADER_MAGIC
+.long MULTIBOOT_HEADER_FLAGS
+.long CHECKSUM
+
+# '_start'指定ELF入口点。  既然当引导程序进入此代码时我们还没设置
+# 虚拟内存，我们需要
+# bootloader跳到入口点的*物理*地址。
+.globl		_start
+_start = RELOC(entry)
+
+.globl entry
+entry:
+	movw	$0x1234,0x472			# 热启动
+
+	# 我们尚未设置虚拟内存， 因此我们从
+	# 引导加载程序加载内核的物理地址为：1MB
+	# （加上几个字节）处开始运行.  但是，C代码被链接为在
+	# KERNBASE+1MB 的位置运行。  我们建立了一个简单的页面目录，
+	# 将虚拟地址[KERNBASE，KERNBASE + 4MB）转换为
+	# 物理地址[0，4MB）。  这4MB区域
+	# 直到我们在实验2 mem_init中设置真实页面表为止
+	# 是足够的。
+
+	# 将entry_pgdir的物理地址加载到cr3中。   entry_pgdir
+	# 在entrypgdir.c中定义。
+	movl	$(RELOC(entry_pgdir)), %eax
+	movl	%eax, %cr3
+	# 打开分页功能。
+	movl	%cr0, %eax
+	orl	$(CR0_PE|CR0_PG|CR0_WP), %eax
+	movl	%eax, %cr0
+
+	# 现在启用了分页，但是我们仍在低EIP上运行
+	# （为什么这样可以？） 进入之前先跳到上方c代码中的
+	# KERNBASE
+	mov	$relocated, %eax
+	jmp	*%eax
+relocated:
+
+	# 清除帧指针寄存器（EBP）
+	# 这样，一旦我们调试C代码，
+	# 堆栈回溯将正确终止。
+	movl	$0x0,%ebp			# 空帧指针
+
+	# 设置堆栈指针
+	movl	$(bootstacktop),%esp
+
+	# 现在转到C代码
+	call	i386_init
+
+	# 代码永远不会到这里，但如果到了，那就让它循环死机吧。
+spin:	jmp	spin
+
+
+.data
+###################################################################
+# 启动堆栈
+###################################################################
+	.p2align	PGSHIFT		# 页面对齐
+	.globl		bootstack
+bootstack:
+	.space		KSTKSIZE
+	.globl		bootstacktop   
+bootstacktop:
+
+```
+
+不在这两个范围之一内的任何虚拟地址都将导致硬件异常：导致QEMU转储计算机状态并退出。
+
+#### 练习7：
+
+使用QEMU和GDB跟踪到JOS内核并在movl %eax, %cr0处停止。检查0x00100000和0xf0100000的内存。现在，使用stepiGDB命令单步执行该指令。同样，检查内存为0x00100000和0xf0100000。
+
+在movl %eax, %cr0处停止：
+
+```
+(gdb) x 0x00100000
+   0x100000:	add    0x1bad(%eax),%dh
+(gdb) x 0xf0100000
+   0xf0100000 <_start-268435468>:	add    %al,(%eax)
+```
+
+si：
+
+```
+0x00100028 in ?? ()
+(gdb) x 0x00100000
+   0x100000:	add    0x1bad(%eax),%dh
+(gdb) x 0xf0100000
+   0xf0100000 <_start-268435468>:	add    0x1bad(%eax),%dh
+
+```
+
+建立新映射后 的第一条指令是:
+
+mov	$relocated, %eax
+
+这时的eax是：
+
+(gdb) info registers
+eax            0xf010002f          -267386833
+
+
+### 格式化打印到控制台：
+
+- kern/printf.c
+
+    内核的cprintf控制台输出的简单实现，
+    基于printfmt（）和内核控制台的cputchar（）。
+
+- lib/printfmt.c
+
+
+
+```c
+// 精简的基本printf样式格式化例程，
+// 被printf，sprintf，fprintf等共同使用
+// 内核和用户程序也使用此代码。
+
+#include <inc/types.h>
+#include <inc/stdio.h>
+#include <inc/string.h>
+#include <inc/stdarg.h>
+#include <inc/error.h>
+
+/*
+ * 数字支持空格或零填充和字段宽度格式。
+ * 
+ *
+ * 特殊格式％e带有整数错误代码
+ * 并输出描述错误的字符串。
+ * 整数可以是正数或负数，
+ * ，使-E_NO_MEM和E_NO_MEM等效。
+ */
+
+static const char * const error_string[MAXERROR] =
+{
+	[E_UNSPECIFIED]	= "unspecified error",
+	[E_BAD_ENV]	= "bad environment",
+	[E_INVAL]	= "invalid parameter",
+	[E_NO_MEM]	= "out of memory",
+	[E_NO_FREE_ENV]	= "out of environments",
+	[E_FAULT]	= "segmentation fault",
+};
+
+/*
+ * 使用指定的putch函数和关联的指针putdat
+ * 以相反的顺序打印数字（基数<= 16）.
+ */
+static void
+printnum(void (*putch)(int, void*), void *putdat,
+	 unsigned long long num, unsigned base, int width, int padc)
+{
+	// 首先递归地打印所有前面的（更重要的）数字
+	if (num >= base) {
+		printnum(putch, putdat, num / base, base, width - 1, padc);
+	} else {
+		// 在第一个数字前打印任何需要的填充字符
+		while (--width > 0)
+			putch(padc, putdat);
+	}
+
+	// 然后打印此（最低有效）数字
+	putch("0123456789abcdef"[num % base], putdat);
+}
+
+// 从varargs列表中获取各种可能大小的unsigned int，
+// 取决于lflag参数。
+static unsigned long long
+getuint(va_list *ap, int lflag)
+{
+	if (lflag >= 2)
+		return va_arg(*ap, unsigned long long);
+	else if (lflag)
+		return va_arg(*ap, unsigned long);
+	else
+		return va_arg(*ap, unsigned int);
+}
+
+// 与getuint相同
+// 符号扩展
+static long long
+getint(va_list *ap, int lflag)
+{
+	if (lflag >= 2)
+		return va_arg(*ap, long long);
+	else if (lflag)
+		return va_arg(*ap, long);
+	else
+		return va_arg(*ap, int);
+}
+
+
+// 用于格式化和打印字符串的主要函数
+void printfmt(void (*putch)(int, void*), void *putdat, const char *fmt, ...);
+
+void
+vprintfmt(void (*putch)(int, void*), void *putdat, const char *fmt, va_list ap)
+{
+	register const char *p;
+	register int ch, err;
+	unsigned long long num;
+	int base, lflag, width, precision, altflag;
+	char padc;
+
+	while (1) {
+		while ((ch = *(unsigned char *) fmt++) != '%') {
+			if (ch == '\0')
+				return;
+			putch(ch, putdat);
+		}
+
+		// 处理％转义序列
+		padc = ' ';
+		width = -1;
+		precision = -1;
+		lflag = 0;
+		altflag = 0;
+	reswitch:
+		switch (ch = *(unsigned char *) fmt++) {
+
+		// 标记以在右侧填充
+		case '-':
+			padc = '-';
+			goto reswitch;
+
+		// 标记以0代替空格
+		case '0':
+			padc = '0';
+			goto reswitch;
+
+		// 宽度字段
+		case '1':
+		case '2':
+		case '3':
+		case '4':
+		case '5':
+		case '6':
+		case '7':
+		case '8':
+		case '9':
+			for (precision = 0; ; ++fmt) {
+				precision = precision * 10 + ch - '0';
+				ch = *fmt;
+				if (ch < '0' || ch > '9')
+					break;
+			}
+			goto process_precision;
+
+		case '*':
+			precision = va_arg(ap, int);
+			goto process_precision;
+
+		case '.':
+			if (width < 0)
+				width = 0;
+			goto reswitch;
+
+		case '#':
+			altflag = 1;
+			goto reswitch;
+
+		process_precision:
+			if (width < 0)
+				width = precision, precision = -1;
+			goto reswitch;
+
+		// long标志（对long long加倍）
+		case 'l':
+			lflag++;
+			goto reswitch;
+
+		// 字符
+		case 'c':
+			putch(va_arg(ap, int), putdat);
+			break;
+
+		// 错误信息
+		case 'e':
+			err = va_arg(ap, int);
+			if (err < 0)
+				err = -err;
+			if (err >= MAXERROR || (p = error_string[err]) == NULL)
+				printfmt(putch, putdat, "error %d", err);
+			else
+				printfmt(putch, putdat, "%s", p);
+			break;
+
+		// 字符串
+		case 's':
+			if ((p = va_arg(ap, char *)) == NULL)
+				p = "(null)";
+			if (width > 0 && padc != '-')
+				for (width -= strnlen(p, precision); width > 0; width--)
+					putch(padc, putdat);
+			for (; (ch = *p++) != '\0' && (precision < 0 || --precision >= 0); width--)
+				if (altflag && (ch < ' ' || ch > '~'))
+					putch('?', putdat);
+				else
+					putch(ch, putdat);
+			for (; width > 0; width--)
+				putch(' ', putdat);
+			break;
+
+		// （带符号）十进制
+		case 'd':
+			num = getint(&ap, lflag);
+			if ((long long) num < 0) {
+				putch('-', putdat);
+				num = -(long long) num;
+			}
+			base = 10;
+			goto number;
+
+		// 无符号十进制
+		case 'u':
+			num = getuint(&ap, lflag);
+			base = 10;
+			goto number;
+
+		// （无符号）八进制
+		case 'o':
+			num = getint(&ap, lflag);
+			if ((long long) num < 0) {
+				putch('-', putdat);
+				num = -(long long) num;
+			}
+			base = 8;
+			goto number;
+
+		// 指针
+		case 'p':
+			putch('0', putdat);
+			putch('x', putdat);
+			num = (unsigned long long)
+				(uintptr_t) va_arg(ap, void *);
+			base = 16;
+			goto number;
+
+		// （无符号）十六进制
+		case 'x':
+			num = getuint(&ap, lflag);
+			base = 16;
+		number:
+			printnum(putch, putdat, num, base, width, padc);
+			break;
+
+		// 跳过 %
+		case '%':
+			putch(ch, putdat);
+			break;
+
+		// 遇到不符合规范的%格式，跳过
+		default:
+			putch('%', putdat);
+			for (fmt--; fmt[-1] != '%'; fmt--)
+				/* do nothing */;
+			break;
+		}
+	}
+}
+
+
+```
+
+- kern/console.c
+
+控制台IO相关代码；
+
+#### 练习8：
+
+我们省略了一小段代码-使用“％o”形式的模式打印八进制数字所必需的代码。查找并填写此代码片段。
+
+```c
+		case 'o':
+			num = getint(&ap, lflag);
+			if ((long long) num < 0) {
+				putch('-', putdat);
+				num = -(long long) num;
+			}
+			base = 8;
+			goto number;
+```
+
+参考：[https://blog.csdn.net/weixin_30466039/article/details/97003339?utm_medium=distribute.pc_relevant.none-task-blog-OPENSEARCH-7.compare&depth_1-utm_source=distribute.pc_relevant.none-task-blog-OPENSEARCH-7.compare](https://blog.csdn.net/weixin_30466039/article/details/97003339?utm_medium=distribute.pc_relevant.none-task-blog-OPENSEARCH-7.compare&depth_1-utm_source=distribute.pc_relevant.none-task-blog-OPENSEARCH-7.compare)
+
+1. 解释printf.c和 console.c之间的接口。
+   
+    console.c 提供了输入输出字符的功能，大部分都在处理IO接口相关。
+
+2. 从console.c解释以下内容：
+
+```
+if (crt_pos >= CRT_SIZE) {
+       int i;
+        memcpy(crt_buf, crt_buf + CRT_COLS, (CRT_SIZE - CRT_COLS) * sizeof(uint16_t));
+       for (i = CRT_SIZE - CRT_COLS; i < CRT_SIZE; i++)
+               crt_buf[i] = 0x0700 | ' ';
+       crt_pos -= CRT_COLS;
+}
+
+```
+
+当crt_pos >= CRT_SIZE，其中CRT_SIZE = 80*25，由于我们知道crt_pos取值范围是0~(80*25-1)，那么这个条件如果成立则说明现在在屏幕上输出的内容已经超过了一页。所以此时要把页面向上滚动一行，即把原来的1~79号行放到现在的0~78行上，然后把79号行换成一行空格（当然并非完全都是空格，0号字符上要显示你输入的字符int c）。所以memcpy操作就是把crt_buf字符数组中1~79号行的内容复制到0~78号行的位置上。而紧接着的for循环则是把最后一行，79号行都变成空格。最后还要修改一下crt_pos的值。
+
+3.  参考上述代码
+4.  “Hello World”
+5. 不确定值
+6. 在vprintfmt中倒序处理参数
+
+
+### 堆栈
+
+在此过程中编写一个有用的新内核监视器函数，该函数将显示堆栈的回溯信息：保存的列表来自导致当前执行点的嵌套调用指令的指令指针（IP）值。
+
