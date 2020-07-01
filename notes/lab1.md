@@ -967,3 +967,230 @@ if (crt_pos >= CRT_SIZE) {
 
 在此过程中编写一个有用的新内核监视器函数，该函数将显示堆栈的回溯信息：保存的列表来自导致当前执行点的嵌套调用指令的指令指针（IP）值。
 
+### 练习10：
+
+[http://www.cnblogs.com/fatsheep9146/p/5079930.html](http://www.cnblogs.com/fatsheep9146/p/5079930.html)
+
+### 练习11：
+
+实现上述指定的backtrace函数。（默认参数下，并没有遇到文中的bug
+
+先了解一下test_backtrace是做什么的；然后打印出堆栈信息和ebp函数调用链链信息，观察即可发现。
+
+
+代码：
+
+```c
+int
+mon_backtrace(int argc, char **argv, struct Trapframe *tf)
+{
+	cprintf("Stack backtrace:\n");
+	uint32_t *ebp;
+	ebp = (uint32_t *)read_ebp();
+	while(ebp!=0){
+		cprintf("  ebp %08x",ebp);
+		cprintf(" eip %08x  args",*(ebp+1));
+		for(int i=2;i<7;++i)
+			cprintf(" %08x",*(ebp+i));
+		cprintf("\n");
+		ebp = (uint32_t *)*ebp;
+	}
+	return 0;
+}
+```
+
+打印输出：
+
+```
+  ebp f0110f18 eip f01000a5  args 00000000 00000000 00000000 f010004e f0112308
+  ebp f0110f38 eip f010007a  args 00000000 00000001 f0110f78 f010004e f0112308
+  ebp f0110f58 eip f010007a  args 00000001 00000002 f0110f98 f010004e f0112308
+  ebp f0110f78 eip f010007a  args 00000002 00000003 f0110fb8 f010004e f0112308
+  ebp f0110f98 eip f010007a  args 00000003 00000004 00000000 f010004e f0112308
+  ebp f0110fb8 eip f010007a  args 00000004 00000005 00000000 f010004e f0112308
+  ebp f0110fd8 eip f01000fc  args 00000005 00001aac 00000640 00000000 00000000
+  ebp f0110ff8 eip f010003e  args 00000003 00001003 00002003 00003003 00004003
+
+```
+
+（为什么回溯代码无法检测到实际有多少个参数？如何解决此限制？）:可以利用后续的获取调试信息的方法；
+
+### 练习12：
+
+通过objdump打印出符号表信息，并尝试找到函数；
+
+```
+yunwei@ubuntu:~/lab$ objdump -G obj/kern/kernel | grep f01000
+0      SO     0      0      f0100000 1      {standard input}
+1      SOL    0      0      f010000c 18     kern/entry.S
+2      SLINE  0      44     f010000c 0      
+3      SLINE  0      57     f0100015 0      
+4      SLINE  0      58     f010001a 0      
+5      SLINE  0      60     f010001d 0      
+6      SLINE  0      61     f0100020 0      
+7      SLINE  0      62     f0100025 0      
+8      SLINE  0      67     f0100028 0      
+9      SLINE  0      68     f010002d 0      
+10     SLINE  0      74     f010002f 0      
+11     SLINE  0      77     f0100034 0      
+12     SLINE  0      80     f0100039 0      
+13     SLINE  0      83     f010003e 0      
+14     SO     0      2      f0100040 31     kern/entrypgdir.c
+72     SO     0      0      f0100040 0      
+73     SO     0      2      f0100040 2889   kern/init.c
+108    FUN    0      0      f0100040 2973   test_backtrace:F(0,25)
+118    FUN    0      0      f01000aa 3014   i386_init:F(0,25)
+
+```
+
+看看`kdebug.h`里面的`debuginfo_eip`函数:
+
+```c
+#ifndef JOS_KERN_KDEBUG_H
+#define JOS_KERN_KDEBUG_H
+
+#include <inc/types.h>
+
+// 调试有关特定指令指针的信息
+struct Eipdebuginfo {
+	const char *eip_file;		// EIP的源代码文件名
+	int eip_line;			//  EIP的源代码行号
+
+	const char *eip_fn_name;	// 包含EIP的函数的名称
+					//  - 注意：不为空终止！
+	int eip_fn_namelen;		// 函数名称的长度
+	uintptr_t eip_fn_addr;		// 函数开始地址
+	int eip_fn_narg;		// 函数参数的数量
+};
+
+int debuginfo_eip(uintptr_t eip, struct Eipdebuginfo *info);
+
+#endif
+```
+
+由于包含EIP的函数的名称不为空终止，因此需要使用提示：
+
+>提示：printf格式字符串为打印非空终止的字符串（如STABS表中的字符串）提供了一种简单而又晦涩的方法。 printf("%.*s", length, string)最多可打印的length字符string。查看printf手册页，以了解其工作原理。
+
+在 mon_backtrace() 中继续修改，使用 debuginfo_eip 获取相关信息并打印：
+
+```c
+int
+mon_backtrace(int argc, char **argv, struct Trapframe *tf)
+{
+	cprintf("Stack backtrace:\n");
+	uint32_t *ebp;
+	int valid;
+	struct Eipdebuginfo ei;
+	ebp = (uint32_t *)read_ebp();
+	while(ebp!=0){
+		cprintf("  ebp %08x",ebp);
+		cprintf(" eip %08x  args",*(ebp+1));
+		valid = debuginfo_eip(*(ebp+1),&ei);
+		for(int i=2;i<7;++i)
+			cprintf(" %08x",*(ebp+i));
+		cprintf("\n");
+		if(valid == 0)
+			cprintf("         %s:%d: %.*s+%d\n",ei.eip_file,ei.eip_line,ei.eip_fn_namelen,ei.eip_fn_name,*(ebp+1) - ei.eip_fn_addr);
+		ebp = (uint32_t *)*ebp;
+	}
+	return 0;
+}
+```
+
+可以参考 inc/stab.h:
+
+```c
+//JOS uses the N_SO, N_SOL, N_FUN, and N_SLINE types.
+#define	N_SLINE		0x44	// text segment line number
+```
+
+知道我们需要使用N_SLINE进行搜索；以及stab的数据结构：
+
+```c
+// Entries in the STABS table are formatted as follows.
+struct Stab {
+	uint32_t n_strx;	// index into string table of name
+	uint8_t n_type;         // type of symbol
+	uint8_t n_other;        // misc info (usually empty)
+	uint16_t n_desc;        // description field
+	uintptr_t n_value;	// value of symbol
+};
+```
+
+参考  的注释部分：
+
+```c
+// stab_binsearch(stabs, region_left, region_right, type, addr)
+//
+//	某些stab类型按升序排列在地址中
+//	例如， N_FUN stabs ( n_type ==
+//	N_FUN 的 stabs 条目), 标记了函数, 和 N_SO stabs,标记源文件。
+//
+//	给定指令地址，此函数查找单个 stab
+//	条目， 包含该地址的'type'类型。
+//
+//	搜索在[* region_left，* region_right]范围内进行。
+//	因此，要搜索整个N个stabs，可以执行以下操作：
+//
+//		left = 0;
+//		right = N - 1;     /* rightmost stab */
+//		stab_binsearch(stabs, &left, &right, type, addr);
+//
+```
+
+在 kern/kdebug.c 中 debuginfo_eip 相应位置修改，添加行数搜索：
+
+```c
+	stab_binsearch(stabs, &lline, &rline, N_SLINE, addr);
+	if(lline<=rline){
+		info->eip_line = stabs[rline].n_value;
+	}else{
+		info->eip_line = 0;
+		return -1;
+	}
+
+```
+
+## pass
+
+```
+running JOS: (1.4s) 
+  printf: OK 
+  backtrace count: OK 
+  backtrace arguments: OK 
+  backtrace symbols: OK 
+  backtrace lines: OK 
+Score: 50/50
+
+
+```
+
+结果是：
+
+```
+Stack backtrace:
+  ebp f0110f18 eip f01000a5  args 00000000 00000000 00000000 f010004e f0112308
+         kern/init.c:6: test_backtrace+101
+  ebp f0110f38 eip f010007a  args 00000000 00000001 f0110f78 f010004e f0112308
+         kern/init.c:46: test_backtrace+58
+  ebp f0110f58 eip f010007a  args 00000001 00000002 f0110f98 f010004e f0112308
+         kern/init.c:46: test_backtrace+58
+  ebp f0110f78 eip f010007a  args 00000002 00000003 f0110fb8 f010004e f0112308
+         kern/init.c:46: test_backtrace+58
+  ebp f0110f98 eip f010007a  args 00000003 00000004 00000000 f010004e f0112308
+         kern/init.c:46: test_backtrace+58
+  ebp f0110fb8 eip f010007a  args 00000004 00000005 00000000 f010004e f0112308
+         kern/init.c:46: test_backtrace+58
+  ebp f0110fd8 eip f01000fc  args 00000005 00001aac 00000640 00000000 00000000
+         kern/init.c:70: i386_init+82
+  ebp f0110ff8 eip f010003e  args 00000003 00001003 00002003 00003003 00004003
+         kern/entry.S:-267386818: <unknown>+0
+
+```
+
+虽然似乎eip并不一定指向对应的行...
+
+## 总结：
+
+这两天大致搞清楚了boot的方式，然后浏览了一小部分的对应源代码（虽然也不是很多的样子），gdb还不算很熟练，大部分情况下还是使用cprintf打log；
